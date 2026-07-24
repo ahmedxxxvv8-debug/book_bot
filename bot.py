@@ -16,6 +16,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+ACCESS_PASSWORD = os.environ["ACCESS_PASSWORD"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -33,6 +34,62 @@ TERMS = {
     "1": "الترم الأول",
     "2": "الترم الثاني",
 }
+
+
+# ============ التحقق من الصلاحية ============
+def is_authorized(chat_id):
+    result = (
+        supabase.table("authorized_users")
+        .select("chat_id")
+        .eq("chat_id", chat_id)
+        .execute()
+    )
+    return len(result.data) > 0
+
+
+def authorize_user(chat_id):
+    supabase.table("authorized_users").insert({"chat_id": chat_id}).execute()
+
+
+async def require_auth_message(update: Update) -> bool:
+    """يرجع True لو المستخدم مسموح له، وإلا يرد برسالة ويرجع False"""
+    chat_id = update.message.chat_id
+    if is_authorized(chat_id):
+        return True
+    await update.message.reply_text(
+        "🔒 البوت خاص، اكتب الباسورد الأول:\n/login الباسورد"
+    )
+    return False
+
+
+async def require_auth_callback(update: Update) -> bool:
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    if is_authorized(chat_id):
+        return True
+    await query.answer("🔒 لازم تسجل دخول الأول بالباسورد", show_alert=True)
+    return False
+
+
+# ============ تسجيل الدخول ============
+async def login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+
+    if is_authorized(chat_id):
+        await update.message.reply_text("✅ أنت مسجل دخول بالفعل.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("اكتب كده: /login الباسورد")
+        return
+
+    entered_password = " ".join(context.args)
+
+    if entered_password == ACCESS_PASSWORD:
+        authorize_user(chat_id)
+        await update.message.reply_text("✅ تم الدخول بنجاح! اكتب /start عشان تشوف الأوامر.")
+    else:
+        await update.message.reply_text("❌ باسورد غلط.")
 
 
 def years_keyboard(prefix):
@@ -77,6 +134,9 @@ def get_subjects(year, term):
 
 # ============ استقبال ملف PDF أو صورة ============
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
+
     message = update.message
     caption = message.caption
 
@@ -118,6 +178,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ اختيار السنة وقت الحفظ ============
 async def handle_save_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
     query = update.callback_query
     await query.answer()
     year = query.data.split(":")[1]
@@ -134,6 +196,8 @@ async def handle_save_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ اختيار الترم وقت الحفظ ============
 async def handle_save_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
     query = update.callback_query
     await query.answer()
     _, year, term = query.data.split(":")
@@ -148,6 +212,8 @@ async def handle_save_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ طلب اسم مادة جديدة ============
 async def handle_new_subject_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
     query = update.callback_query
     await query.answer()
     _, year, term = query.data.split(":")
@@ -158,6 +224,9 @@ async def handle_new_subject_button(update: Update, context: ContextTypes.DEFAUL
 # ============ استقبال اسم مادة جديدة كنص ============
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "awaiting_new_subject" not in context.user_data:
+        return
+
+    if not await require_auth_message(update):
         return
 
     year, term = context.user_data.pop("awaiting_new_subject")
@@ -173,6 +242,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ اختيار مادة موجودة وقت الحفظ ============
 async def handle_save_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
     query = update.callback_query
     await query.answer()
     _, year, term, subject = query.data.split(":", 3)
@@ -207,6 +278,8 @@ async def finalize_save(target, context, year, term, subject, is_callback=False)
 
 # ============ قائمة التصفح: /menu ============
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
     await update.message.reply_text(
         "📅 اختار السنة الدراسية:",
         reply_markup=years_keyboard("browseyear"),
@@ -214,6 +287,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_browse_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
     query = update.callback_query
     await query.answer()
     year = query.data.split(":")[1]
@@ -224,6 +299,8 @@ async def handle_browse_year(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_browse_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
     query = update.callback_query
     await query.answer()
     _, year, term = query.data.split(":")
@@ -240,6 +317,8 @@ async def handle_browse_term(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_browse_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
     query = update.callback_query
     await query.answer()
     _, year, term, subject = query.data.split(":", 3)
@@ -269,6 +348,9 @@ async def handle_browse_subject(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ============ البحث بالاسم ============
 async def find_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
+
     query = " ".join(context.args)
     if not query:
         await update.message.reply_text("اكتب كده: /find اسم الكتاب أو جزء من الاسم")
@@ -296,6 +378,13 @@ async def find_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ رسالة البداية ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if not is_authorized(chat_id):
+        await update.message.reply_text(
+            "🔒 أهلاً بيك، البوت ده خاص.\nاكتب: /login الباسورد"
+        )
+        return
+
     await update.message.reply_text(
         "أهلاً بيك 👋\n\n"
         "علشان تحفظ ملف: ابعته PDF أو صورة، واكتب اسم الكتاب في خانة الوصف (caption)، وهيطلب منك تحدد السنة والترم والمادة.\n"
@@ -308,6 +397,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("login", login))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("find", find_book))
 
