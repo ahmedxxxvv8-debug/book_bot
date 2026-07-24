@@ -1,18 +1,19 @@
 import os
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 from supabase import create_client
 
-# ============ الإعدادات (بتيجي من Environment Variables على Railway) ============
+# ============ الإعدادات ============
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]  # آي دي القناة الخاصة اللي هيتخزن فيها الملفات
+CHANNEL_ID = os.environ["CHANNEL_ID"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
@@ -20,51 +21,253 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(level=logging.INFO)
 
+YEARS = {
+    "1": "السنة الأولى",
+    "2": "السنة الثانية",
+    "3": "السنة الثالثة",
+    "4": "السنة الرابعة",
+    "5": "السنة الخامسة",
+}
+
+TERMS = {
+    "1": "الترم الأول",
+    "2": "الترم الثاني",
+}
+
+
+def years_keyboard(prefix):
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:{key}")]
+        for key, label in YEARS.items()
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def terms_keyboard(prefix, year):
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:{year}:{key}")]
+        for key, label in TERMS.items()
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def subjects_keyboard(prefix, year, term, subjects, include_new=False):
+    buttons = [
+        [InlineKeyboardButton(s, callback_data=f"{prefix}:{year}:{term}:{s}")]
+        for s in subjects
+    ]
+    if include_new:
+        buttons.append(
+            [InlineKeyboardButton("➕ مادة جديدة", callback_data=f"newsubject:{year}:{term}")]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_subjects(year, term):
+    result = (
+        supabase.table("books")
+        .select("subject")
+        .eq("year", year)
+        .eq("term", term)
+        .execute()
+    )
+    subjects = sorted(set(r["subject"] for r in result.data if r.get("subject")))
+    return subjects
+
 
 # ============ استقبال ملف PDF أو صورة ============
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    caption = message.caption  # الاسم اللي المستخدم كاتبه مع الملف
+    caption = message.caption
 
     if not caption:
         await message.reply_text(
-            "⚠️ لازم تكتب اسم/تاج للملف في نفس رسالة الإرسال (في خانة الـ caption).\n"
-            "مثال: فيزياء 2 - الفصل 3"
+            "⚠️ لازم تكتب اسم للملف في خانة الوصف (caption) قبل الإرسال.\n"
+            "مثال: تشريح - محاضرة 1"
         )
         return
 
-    # تحديد نوع الملف (PDF أو صورة)
     if message.document:
         file_id_original = message.document.file_id
         file_name = message.document.file_name or "ملف"
     elif message.photo:
-        file_id_original = message.photo[-1].file_id  # أعلى جودة
+        file_id_original = message.photo[-1].file_id
         file_name = "صورة"
     else:
         return
 
-    # إعادة إرسال الملف لقناة الأرشيف الخاصة عشان ناخد نسخة دائمة منه
     forwarded = await context.bot.forward_message(
         chat_id=CHANNEL_ID,
         from_chat_id=message.chat_id,
         message_id=message.message_id,
     )
 
-    # تخزين البيانات في قاعدة البيانات
+    context.user_data["pending_upload"] = {
+        "title": caption,
+        "file_name": file_name,
+        "telegram_file_id": file_id_original,
+        "channel_message_id": forwarded.message_id,
+        "owner_chat_id": message.chat_id,
+    }
+
+    await message.reply_text(
+        "📅 اختار السنة الدراسية لهذا الملف:",
+        reply_markup=years_keyboard("saveyear"),
+    )
+
+
+# ============ اختيار السنة وقت الحفظ ============
+async def handle_save_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    year = query.data.split(":")[1]
+
+    if "pending_upload" not in context.user_data:
+        await query.edit_message_text("⚠️ حصل خطأ، ابعت الملف تاني من فضلك.")
+        return
+
+    await query.edit_message_text(
+        f"📆 اختار الترم ({YEARS[year]}):",
+        reply_markup=terms_keyboard("saveterm", year),
+    )
+
+
+# ============ اختيار الترم وقت الحفظ ============
+async def handle_save_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, year, term = query.data.split(":")
+
+    subjects = get_subjects(year, term)
+
+    await query.edit_message_text(
+        f"📚 اختار المادة ({YEARS[year]} - {TERMS[term]}):",
+        reply_markup=subjects_keyboard("savesubject", year, term, subjects, include_new=True),
+    )
+
+
+# ============ طلب اسم مادة جديدة ============
+async def handle_new_subject_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, year, term = query.data.split(":")
+    context.user_data["awaiting_new_subject"] = (year, term)
+    await query.edit_message_text("✏️ اكتب اسم المادة الجديدة في رسالة:")
+
+
+# ============ استقبال اسم مادة جديدة كنص ============
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "awaiting_new_subject" not in context.user_data:
+        return
+
+    year, term = context.user_data.pop("awaiting_new_subject")
+    subject = update.message.text.strip()
+
+    pending = context.user_data.get("pending_upload")
+    if not pending:
+        await update.message.reply_text("⚠️ حصل خطأ، ابعت الملف تاني من فضلك.")
+        return
+
+    await finalize_save(update.message, context, year, term, subject)
+
+
+# ============ اختيار مادة موجودة وقت الحفظ ============
+async def handle_save_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, year, term, subject = query.data.split(":", 3)
+    await finalize_save(query, context, year, term, subject, is_callback=True)
+
+
+async def finalize_save(target, context, year, term, subject, is_callback=False):
+    pending = context.user_data.pop("pending_upload", None)
+    if not pending:
+        text = "⚠️ حصل خطأ، ابعت الملف تاني من فضلك."
+        if is_callback:
+            await target.edit_message_text(text)
+        else:
+            await target.reply_text(text)
+        return
+
     supabase.table("books").insert(
         {
-            "title": caption,
-            "file_name": file_name,
-            "telegram_file_id": file_id_original,
-            "channel_message_id": forwarded.message_id,
-            "owner_chat_id": message.chat_id,
+            **pending,
+            "year": year,
+            "term": term,
+            "subject": subject,
         }
     ).execute()
 
-    await message.reply_text(f"✅ اتحفظ باسم: {caption}")
+    text = f"✅ اتحفظ: {pending['title']}\n📅 {YEARS[year]} - {TERMS[term]}\n📚 {subject}"
+    if is_callback:
+        await target.edit_message_text(text)
+    else:
+        await target.reply_text(text)
 
 
-# ============ البحث عن كتاب ============
+# ============ قائمة التصفح: /menu ============
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📅 اختار السنة الدراسية:",
+        reply_markup=years_keyboard("browseyear"),
+    )
+
+
+async def handle_browse_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    year = query.data.split(":")[1]
+    await query.edit_message_text(
+        f"📆 اختار الترم ({YEARS[year]}):",
+        reply_markup=terms_keyboard("browseterm", year),
+    )
+
+
+async def handle_browse_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, year, term = query.data.split(":")
+    subjects = get_subjects(year, term)
+
+    if not subjects:
+        await query.edit_message_text(f"لا يوجد كتب محفوظة في {YEARS[year]} - {TERMS[term]} بعد.")
+        return
+
+    await query.edit_message_text(
+        f"📚 اختار المادة ({YEARS[year]} - {TERMS[term]}):",
+        reply_markup=subjects_keyboard("browsesubject", year, term, subjects),
+    )
+
+
+async def handle_browse_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, year, term, subject = query.data.split(":", 3)
+
+    result = (
+        supabase.table("books")
+        .select("*")
+        .eq("year", year)
+        .eq("term", term)
+        .eq("subject", subject)
+        .execute()
+    )
+
+    rows = result.data
+    if not rows:
+        await query.edit_message_text("❌ مفيش ملفات في المادة دي.")
+        return
+
+    await query.edit_message_text(f"📚 ملفات {subject}:")
+    for row in rows:
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=row["telegram_file_id"],
+            caption=f"📘 {row['title']}",
+        )
+
+
+# ============ البحث بالاسم ============
 async def find_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     if not query:
@@ -91,24 +294,13 @@ async def find_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ============ عرض كل الكتب المخزنة ============
-async def list_books(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = supabase.table("books").select("title").execute()
-    rows = result.data
-    if not rows:
-        await update.message.reply_text("لسه مفيش كتب متخزنة.")
-        return
-    titles = "\n".join(f"• {r['title']}" for r in rows)
-    await update.message.reply_text(f"📚 الكتب المتاحة:\n\n{titles}")
-
-
 # ============ رسالة البداية ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بيك 👋\n\n"
-        "علشان تحفظ ملف: ابعته PDF أو صورة، واكتب اسم الكتاب في خانة الوصف (caption).\n"
-        "علشان تدور على كتاب: /find اسم الكتاب\n"
-        "علشان تشوف كل الكتب: /list"
+        "علشان تحفظ ملف: ابعته PDF أو صورة، واكتب اسم الكتاب في خانة الوصف (caption)، وهيطلب منك تحدد السنة والترم والمادة.\n"
+        "علشان تتصفح: /menu\n"
+        "علشان تدور بالاسم: /find اسم الكتاب"
     )
 
 
@@ -116,9 +308,19 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("find", find_book))
-    app.add_handler(CommandHandler("list", list_books))
+
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_handler(CallbackQueryHandler(handle_save_year, pattern=r"^saveyear:"))
+    app.add_handler(CallbackQueryHandler(handle_save_term, pattern=r"^saveterm:"))
+    app.add_handler(CallbackQueryHandler(handle_new_subject_button, pattern=r"^newsubject:"))
+    app.add_handler(CallbackQueryHandler(handle_save_subject, pattern=r"^savesubject:"))
+    app.add_handler(CallbackQueryHandler(handle_browse_year, pattern=r"^browseyear:"))
+    app.add_handler(CallbackQueryHandler(handle_browse_term, pattern=r"^browseterm:"))
+    app.add_handler(CallbackQueryHandler(handle_browse_subject, pattern=r"^browsesubject:"))
 
     app.run_polling()
 
