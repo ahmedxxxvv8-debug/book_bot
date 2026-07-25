@@ -42,6 +42,8 @@ FILE_TYPES = {
     "summary": "📝 ملخص",
 }
 
+NO_SECTION = "__NONE__"
+
 
 # ============ الصلاحيات ============
 def get_role(chat_id):
@@ -167,6 +169,26 @@ def subjects_keyboard(prefix, subjects, include_new=False):
     return InlineKeyboardMarkup(buttons)
 
 
+def sections_keyboard_for_save(sections):
+    buttons = [
+        [InlineKeyboardButton(s, callback_data=f"savesection:{i}")]
+        for i, s in enumerate(sections)
+    ]
+    buttons.append([InlineKeyboardButton("🚫 بدون سكشن", callback_data="savesection_none")])
+    buttons.append([InlineKeyboardButton("➕ سكشن جديد", callback_data="newsection")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def sections_keyboard_for_browse(sections, has_none):
+    buttons = [
+        [InlineKeyboardButton(s, callback_data=f"browsesection:{i}")]
+        for i, s in enumerate(sections)
+    ]
+    if has_none:
+        buttons.append([InlineKeyboardButton("🚫 بدون سكشن", callback_data="browsesection_none")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def get_subjects(year, term):
     result = (
         supabase.table("books")
@@ -178,8 +200,32 @@ def get_subjects(year, term):
     return sorted(set(r["subject"] for r in result.data if r.get("subject")))
 
 
+def get_sections(year, term, subject):
+    """يرجع (قايمة السكاشن المسماة، هل فيه ملفات من غير سكشن)"""
+    result = (
+        supabase.table("books")
+        .select("section")
+        .eq("year", year)
+        .eq("term", term)
+        .eq("subject", subject)
+        .execute()
+    )
+    sections = sorted(set(r["section"] for r in result.data if r.get("section")))
+    has_none = any(not r.get("section") for r in result.data)
+    return sections, has_none
+
+
 def type_label(file_type):
     return FILE_TYPES.get(file_type, "")
+
+
+def build_caption(row):
+    caption = f"📘 {row['title']}"
+    if row.get("section"):
+        caption += f" | سكشن {row['section']}"
+    if row.get("file_type"):
+        caption += f" | {type_label(row['file_type'])}"
+    return caption
 
 
 # ============ استقبال ملف PDF أو صورة (رفع) ============
@@ -222,9 +268,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     last = context.user_data.get("last_selection")
     if last:
+        section_text = f" - سكشن {last['section']}" if last.get("section") else ""
         text = (
             f"📌 آخر تصنيف استخدمته:\n"
-            f"{YEARS[last['year']]} - {TERMS[last['term']]} - {last['subject']} - {type_label(last['file_type'])}\n\n"
+            f"{YEARS[last['year']]} - {TERMS[last['term']]} - {last['subject']}{section_text} - {type_label(last['file_type'])}\n\n"
             "تحب تستخدم نفس التصنيف؟"
         )
         buttons = InlineKeyboardMarkup(
@@ -251,7 +298,10 @@ async def handle_quickuse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not last:
         await query.edit_message_text("⚠️ حصل خطأ، اختار من الأول.")
         return
-    await finalize_save(query, context, last["year"], last["term"], last["subject"], last["file_type"], is_callback=True)
+    await finalize_save(
+        query, context, last["year"], last["term"], last["subject"],
+        last.get("section"), last["file_type"], is_callback=True,
+    )
 
 
 async def handle_newclassification(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -303,6 +353,22 @@ async def handle_save_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def go_to_section_step(target, context, is_callback=True):
+    year = context.user_data.get("pending_year")
+    term = context.user_data.get("pending_term")
+    subject = context.user_data.get("pending_subject")
+
+    sections, _ = get_sections(year, term, subject)
+    context.user_data["save_sections_list"] = sections
+
+    text = f"🔖 المادة دي ليها سكشن؟ ({subject})"
+    keyboard = sections_keyboard_for_save(sections)
+    if is_callback:
+        await target.edit_message_text(text, reply_markup=keyboard)
+    else:
+        await target.reply_text(text, reply_markup=keyboard)
+
+
 # ============ اختيار مادة موجودة ============
 async def handle_save_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_callback(update):
@@ -314,13 +380,8 @@ async def handle_save_subject(update: Update, context: ContextTypes.DEFAULT_TYPE
     if idx >= len(subjects):
         await query.edit_message_text("⚠️ حصل خطأ، ابدأ من الأول.")
         return
-    subject = subjects[idx]
-    context.user_data["pending_subject"] = subject
-
-    await query.edit_message_text(
-        "🏷️ نوع الملف؟",
-        reply_markup=types_keyboard("savetype"),
-    )
+    context.user_data["pending_subject"] = subjects[idx]
+    await go_to_section_step(query, context, is_callback=True)
 
 
 # ============ طلب اسم مادة جديدة ============
@@ -331,6 +392,39 @@ async def handle_new_subject_button(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     context.user_data["awaiting_new_subject"] = True
     await query.edit_message_text("✏️ اكتب اسم المادة الجديدة في رسالة:")
+
+
+# ============ اختيار سكشن موجود ============
+async def handle_save_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_callback(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split(":")[1])
+    sections = context.user_data.get("save_sections_list", [])
+    if idx >= len(sections):
+        await query.edit_message_text("⚠️ حصل خطأ، ابدأ من الأول.")
+        return
+    context.user_data["pending_section"] = sections[idx]
+    await query.edit_message_text("🏷️ نوع الملف؟", reply_markup=types_keyboard("savetype"))
+
+
+async def handle_save_section_none(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_callback(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    context.user_data["pending_section"] = None
+    await query.edit_message_text("🏷️ نوع الملف؟", reply_markup=types_keyboard("savetype"))
+
+
+async def handle_new_section_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_callback(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    context.user_data["awaiting_new_section"] = True
+    await query.edit_message_text("✏️ اكتب اسم أو رقم السكشن في رسالة:")
 
 
 # ============ اختيار نوع الملف ============
@@ -344,11 +438,12 @@ async def handle_save_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     year = context.user_data.get("pending_year")
     term = context.user_data.get("pending_term")
     subject = context.user_data.get("pending_subject")
+    section = context.user_data.get("pending_section")
 
-    await finalize_save(query, context, year, term, subject, file_type, is_callback=True)
+    await finalize_save(query, context, year, term, subject, section, file_type, is_callback=True)
 
 
-async def finalize_save(target, context, year, term, subject, file_type, is_callback=False):
+async def finalize_save(target, context, year, term, subject, section, file_type, is_callback=False):
     pending = context.user_data.pop("pending_upload", None)
     if not pending:
         text = "⚠️ حصل خطأ، ابعت الملف تاني من فضلك."
@@ -364,6 +459,7 @@ async def finalize_save(target, context, year, term, subject, file_type, is_call
             "year": year,
             "term": term,
             "subject": subject,
+            "section": section,
             "file_type": file_type,
         }
     ).execute()
@@ -372,16 +468,17 @@ async def finalize_save(target, context, year, term, subject, file_type, is_call
         "year": year,
         "term": term,
         "subject": subject,
+        "section": section,
         "file_type": file_type,
     }
-    context.user_data.pop("pending_year", None)
-    context.user_data.pop("pending_term", None)
-    context.user_data.pop("pending_subject", None)
+    for key in ("pending_year", "pending_term", "pending_subject", "pending_section"):
+        context.user_data.pop(key, None)
 
+    section_text = f" | سكشن {section}" if section else ""
     text = (
         f"✅ اتحفظ: {pending['title']}\n"
         f"📅 {YEARS[year]} - {TERMS[term]}\n"
-        f"📚 {subject} | {type_label(file_type)}"
+        f"📚 {subject}{section_text} | {type_label(file_type)}"
     )
     if is_callback:
         await target.edit_message_text(text)
@@ -389,7 +486,7 @@ async def finalize_save(target, context, year, term, subject, file_type, is_call
         await target.reply_text(text)
 
 
-# ============ استقبال نص (مادة جديدة / إعادة تسمية / بحث مباشر) ============
+# ============ استقبال نص (مادة جديدة / سكشن جديد / إعادة تسمية / بحث مباشر) ============
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if not is_authorized(chat_id):
@@ -403,16 +500,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⛔ الميزة دي للأدمن بس.")
             return
         context.user_data.pop("awaiting_new_subject")
-        year = context.user_data.get("pending_year")
-        term = context.user_data.get("pending_term")
         context.user_data["pending_subject"] = text
-        await update.message.reply_text(
-            "🏷️ نوع الملف؟",
-            reply_markup=types_keyboard("savetype"),
-        )
+        await go_to_section_step(update.message, context, is_callback=False)
         return
 
-    # 2) إعادة تسمية ملف
+    # 2) سكشن جديد وقت الحفظ
+    if context.user_data.get("awaiting_new_section"):
+        if not is_admin(chat_id):
+            await update.message.reply_text("⛔ الميزة دي للأدمن بس.")
+            return
+        context.user_data.pop("awaiting_new_section")
+        context.user_data["pending_section"] = text
+        await update.message.reply_text("🏷️ نوع الملف؟", reply_markup=types_keyboard("savetype"))
+        return
+
+    # 3) إعادة تسمية ملف
     if "awaiting_rename_id" in context.user_data:
         if not is_admin(chat_id):
             await update.message.reply_text("⛔ الميزة دي للأدمن بس.")
@@ -422,7 +524,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ اتغير الاسم إلى: {text}")
         return
 
-    # 3) بحث مباشر بأي كلمة (اسم كتاب أو مادة)
+    # 4) بحث مباشر بأي كلمة (اسم كتاب أو مادة)
     result = (
         supabase.table("books")
         .select("*")
@@ -434,13 +536,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # متردش لو مفيش نتايج، عشان ميضايقش لو كتب كلام عادي
 
     for row in rows:
-        caption = f"📘 {row['title']}"
-        if row.get("file_type"):
-            caption += f" | {type_label(row['file_type'])}"
         await context.bot.send_document(
             chat_id=chat_id,
             document=row["telegram_file_id"],
-            caption=caption,
+            caption=build_caption(row),
         )
 
 
@@ -488,6 +587,34 @@ async def handle_browse_term(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def send_files_for(query, context, year, term, subject, section):
+    q = (
+        supabase.table("books")
+        .select("*")
+        .eq("year", year)
+        .eq("term", term)
+        .eq("subject", subject)
+    )
+    if section == NO_SECTION or section is None:
+        q = q.is_("section", "null")
+    else:
+        q = q.eq("section", section)
+
+    result = q.execute()
+    rows = result.data
+    if not rows:
+        await query.edit_message_text("❌ مفيش ملفات هنا.")
+        return
+
+    await query.edit_message_text(f"📚 ملفات {subject}:")
+    for row in rows:
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=row["telegram_file_id"],
+            caption=build_caption(row),
+        )
+
+
 async def handle_browse_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_callback(update):
         return
@@ -501,31 +628,48 @@ async def handle_browse_subject(update: Update, context: ContextTypes.DEFAULT_TY
     subject = subjects[idx]
     year = context.user_data.get("browse_year")
     term = context.user_data.get("browse_term")
+    context.user_data["browse_subject"] = subject
 
-    result = (
-        supabase.table("books")
-        .select("*")
-        .eq("year", year)
-        .eq("term", term)
-        .eq("subject", subject)
-        .execute()
-    )
+    sections, has_none = get_sections(year, term, subject)
 
-    rows = result.data
-    if not rows:
-        await query.edit_message_text("❌ مفيش ملفات في المادة دي.")
+    if not sections:
+        # كل الملفات من غير سكشن، اعرضها على طول
+        await send_files_for(query, context, year, term, subject, None)
         return
 
-    await query.edit_message_text(f"📚 ملفات {subject}:")
-    for row in rows:
-        caption = f"📘 {row['title']}"
-        if row.get("file_type"):
-            caption += f" | {type_label(row['file_type'])}"
-        await context.bot.send_document(
-            chat_id=query.message.chat_id,
-            document=row["telegram_file_id"],
-            caption=caption,
-        )
+    context.user_data["browse_sections_list"] = sections
+    await query.edit_message_text(
+        f"🔖 اختار السكشن ({subject}):",
+        reply_markup=sections_keyboard_for_browse(sections, has_none),
+    )
+
+
+async def handle_browse_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split(":")[1])
+    sections = context.user_data.get("browse_sections_list", [])
+    if idx >= len(sections):
+        await query.edit_message_text("⚠️ حصل خطأ، ابدأ من /menu تاني.")
+        return
+    section = sections[idx]
+    year = context.user_data.get("browse_year")
+    term = context.user_data.get("browse_term")
+    subject = context.user_data.get("browse_subject")
+    await send_files_for(query, context, year, term, subject, section)
+
+
+async def handle_browse_section_none(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    year = context.user_data.get("browse_year")
+    term = context.user_data.get("browse_term")
+    subject = context.user_data.get("browse_subject")
+    await send_files_for(query, context, year, term, subject, NO_SECTION)
 
 
 # ============ البحث بالاسم: /find ============
@@ -551,13 +695,10 @@ async def find_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for row in rows:
-        caption = f"📘 {row['title']}"
-        if row.get("file_type"):
-            caption += f" | {type_label(row['file_type'])}"
         await context.bot.send_document(
             chat_id=update.message.chat_id,
             document=row["telegram_file_id"],
-            caption=caption,
+            caption=build_caption(row),
         )
 
 
@@ -740,11 +881,16 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_save_term, pattern=r"^saveterm:"))
     app.add_handler(CallbackQueryHandler(handle_new_subject_button, pattern=r"^newsubject$"))
     app.add_handler(CallbackQueryHandler(handle_save_subject, pattern=r"^savesubject:"))
+    app.add_handler(CallbackQueryHandler(handle_save_section, pattern=r"^savesection:"))
+    app.add_handler(CallbackQueryHandler(handle_save_section_none, pattern=r"^savesection_none$"))
+    app.add_handler(CallbackQueryHandler(handle_new_section_button, pattern=r"^newsection$"))
     app.add_handler(CallbackQueryHandler(handle_save_type, pattern=r"^savetype:"))
 
     app.add_handler(CallbackQueryHandler(handle_browse_year, pattern=r"^browseyear:"))
     app.add_handler(CallbackQueryHandler(handle_browse_term, pattern=r"^browseterm:"))
     app.add_handler(CallbackQueryHandler(handle_browse_subject, pattern=r"^browsesubject:"))
+    app.add_handler(CallbackQueryHandler(handle_browse_section, pattern=r"^browsesection:"))
+    app.add_handler(CallbackQueryHandler(handle_browse_section_none, pattern=r"^browsesection_none$"))
 
     app.add_handler(CallbackQueryHandler(handle_delete_select, pattern=r"^delete:"))
     app.add_handler(CallbackQueryHandler(handle_delete_confirm, pattern=r"^deleteconfirm:"))
