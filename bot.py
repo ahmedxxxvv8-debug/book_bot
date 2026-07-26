@@ -997,6 +997,39 @@ async def handle_summarize_select(update: Update, context: ContextTypes.DEFAULT_
         await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
 
 
+# ============ سؤال عام للذكاء الاصطناعي (مش مربوط بملف) ============
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
+    if not gemini_client:
+        await update.message.reply_text("⚠️ ميزة الذكاء الاصطناعي مش مفعّلة، لازم يتضاف GEMINI_API_KEY.")
+        return
+
+    question = " ".join(context.args)
+    if not question:
+        await update.message.reply_text("اكتب كده: /ai سؤالك\nمثال: /ai اشرحلي الفرق بين الالتهاب الحاد والمزمن")
+        return
+
+    thinking_msg = await update.message.reply_text("⏳ بفكر في الإجابة...")
+
+    prompt = (
+        "أجب عن السؤال التالي بشكل منظم وواضح ومرتب (استخدم عناوين ونقاط لو الموضوع فيه أكتر من جزء). "
+        "جاوب بنفس لغة السؤال (لو بالعربي جاوب بالعربي، لو بالإنجليزي جاوب بالإنجليزي).\n\n"
+        f"السؤال: {question}"
+    )
+    try:
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[prompt]
+        )
+        answer = response.text
+    except Exception as e:
+        await thinking_msg.edit_text(f"⚠️ حصل خطأ: {e}")
+        return
+
+    await thinking_msg.delete()
+    await send_long_text(update.message, answer)
+
+
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
@@ -1289,6 +1322,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 تلخيص ملف بالذكاء الاصطناعي: /summarize اسم الملف\n"
         "📋 كويز 20 اختياري + 5 مقالي: /quiz اسم الملف\n"
         "❓ سؤال عن محتوى ملف: /ask اسم الملف\n"
+        "🤖 سؤال عام لأي موضوع: /ai سؤالك\n"
         "🔔 تذكيراتي: /myreminders"
     )
     await update.message.reply_text(text)
@@ -1324,6 +1358,7 @@ def main():
     app.add_handler(CommandHandler("summarize", summarize_command))
     app.add_handler(CommandHandler("quiz", quiz_command))
     app.add_handler(CommandHandler("ask", ask_command))
+    app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("myreminders", myreminders_command))
     app.add_handler(CommandHandler("unremind", unremind_command))
