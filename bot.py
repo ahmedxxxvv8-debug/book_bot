@@ -34,7 +34,7 @@ if GEMINI_API_KEY:
 else:
     gemini_client = None
 
-GEMINI_MODEL_NAME = "gemini-1.5-flash"
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 logging.basicConfig(level=logging.INFO)
 
