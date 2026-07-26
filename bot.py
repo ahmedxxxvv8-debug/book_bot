@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 from supabase import create_client
-import google.generativeai as genai
+from google import genai
 
 # ============ الإعدادات ============
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -30,10 +30,11 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    gemini_model = None
+    gemini_client = None
+
+GEMINI_MODEL_NAME = "gemini-2.0-flash"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -826,7 +827,7 @@ async def cleanup_temp_and_gemini_file(tmp_path, gemini_file):
     """يمسح الملف المؤقت من Railway والملف المرفوع على جوجل، ويعمل تنظيف للذاكرة"""
     if gemini_file is not None:
         try:
-            await asyncio.to_thread(genai.delete_file, gemini_file.name)
+            await asyncio.to_thread(gemini_client.files.delete, name=gemini_file.name)
         except Exception:
             logging.warning("تعذر مسح الملف من جوجل، هيتمسح تلقائيًا بعد 48 ساعة على أي حال.")
 
@@ -852,7 +853,7 @@ async def send_long_text(message_or_query, text, is_callback=False):
 async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
-    if not gemini_model:
+    if not gemini_client:
         await update.message.reply_text("⚠️ ميزة التلخيص مش مفعّلة، لازم يتضاف GEMINI_API_KEY.")
         return
     query_text = " ".join(context.args)
@@ -892,7 +893,7 @@ async def handle_summarize_select(update: Update, context: ContextTypes.DEFAULT_
 
         # 2) رفع فوري لسيرفرات جوجل
         gemini_file = await asyncio.to_thread(
-            genai.upload_file, tmp_path, mime_type="application/pdf"
+            gemini_client.files.upload, file=tmp_path
         )
 
         # 3) طلب التلخيص
@@ -902,7 +903,7 @@ async def handle_summarize_select(update: Update, context: ContextTypes.DEFAULT_
             "(لو الملف بالإنجليزي لخص بالإنجليزي، لو عربي لخص بالعربي)."
         )
         response = await asyncio.to_thread(
-            gemini_model.generate_content, [gemini_file, prompt]
+            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
         )
         summary = response.text
 
@@ -920,7 +921,7 @@ async def handle_summarize_select(update: Update, context: ContextTypes.DEFAULT_
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
-    if not gemini_model:
+    if not gemini_client:
         await update.message.reply_text("⚠️ ميزة السؤال مش مفعّلة، لازم يتضاف GEMINI_API_KEY.")
         return
     query_text = " ".join(context.args)
@@ -950,7 +951,7 @@ async def handle_ask_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def answer_question_about_book(message, context, book_id, question):
-    if not gemini_model:
+    if not gemini_client:
         await message.reply_text("⚠️ ميزة السؤال مش مفعّلة.")
         return
 
@@ -969,7 +970,7 @@ async def answer_question_about_book(message, context, book_id, question):
 
         # 2) رفع فوري لجوجل
         gemini_file = await asyncio.to_thread(
-            genai.upload_file, tmp_path, mime_type="application/pdf"
+            gemini_client.files.upload, file=tmp_path
         )
 
         # 3) طلب الإجابة
@@ -978,7 +979,7 @@ async def answer_question_about_book(message, context, book_id, question):
             f"واذكر رقم الصفحة إن أمكن. جاوب بنفس لغة الملف الأصلي.\n\nالسؤال: {question}"
         )
         response = await asyncio.to_thread(
-            gemini_model.generate_content, [gemini_file, prompt]
+            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
         )
         answer = response.text
 
