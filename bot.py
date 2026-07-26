@@ -224,6 +224,18 @@ def build_caption(row):
     return caption
 
 
+async def send_book_row(bot, chat_id, row):
+    """يبعت الملف كمستند، أو النص كامل لو كانت ملاحظة صوتية محولة لنص"""
+    if row.get("is_text_note"):
+        caption = build_caption(row)
+        content = row.get("text_content") or "(مفيش محتوى)"
+        full_text = f"{caption}\n\n{content}"
+        for chunk in (full_text[i:i + 3800] for i in range(0, len(full_text), 3800)):
+            await bot.send_message(chat_id=chat_id, text=chunk)
+    else:
+        await bot.send_document(chat_id=chat_id, document=row["telegram_file_id"], caption=build_caption(row))
+
+
 # ============ استقبال ملف (رفع) ============
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_admin_message(update):
@@ -244,6 +256,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif message.photo:
         file_id_original = message.photo[-1].file_id
         file_name = "صورة"
+        if gemini_client:
+            asyncio.create_task(run_ocr_and_reply(context, message.chat_id, file_id_original))
     else:
         return
 
@@ -441,6 +455,49 @@ async def finalize_save(target, context, year, term, subject, section, file_type
         await target.reply_text(text)
 
 
+# ============ استقبال رسالة صوتية (تحويل لنص) ============
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_message(update):
+        return
+    if not gemini_client:
+        await update.message.reply_text("⚠️ ميزة تحويل الصوت مش مفعّلة، لازم يتضاف GEMINI_API_KEY.")
+        return
+
+    message = update.message
+    voice = message.voice or message.audio
+    if not voice:
+        return
+
+    await message.reply_text("⏳ بحول الصوت لنص، استنى شوية...")
+
+    tmp_path = None
+    gemini_file = None
+    try:
+        tmp_path = await download_to_temp_file(context, voice.file_id, suffix=".ogg")
+        gemini_file = await asyncio.to_thread(gemini_client.files.upload, file=tmp_path)
+        prompt = (
+            "حوّل هذا التسجيل الصوتي إلى نص مكتوب منظم ومرتب في فقرات واضحة، "
+            "صحح أي أخطاء إملائية بسيطة، واكتب بنفس لغة التسجيل الأصلي."
+        )
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
+        )
+        transcript = response.text
+    except Exception as e:
+        await message.reply_text(f"⚠️ حصل خطأ أثناء التحويل: {e}")
+        return
+    finally:
+        await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
+
+    context.user_data["pending_text_note"] = transcript
+    await send_long_text(message, f"📝 النص المستخرج:\n\n{transcript}")
+    context.user_data["awaiting_note_title"] = True
+    await message.reply_text(
+        "لو عايز تحفظ النص ده في الأرشيف، اكتب اسم/عنوان للملاحظة دلوقتي.\n"
+        "لو مش محتاج تحفظه، تجاهل الرسالة دي وكمل عادي."
+    )
+
+
 # ============ استقبال نص عام ============
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -496,6 +553,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_remind_time_input(update.message, context, text)
         return
 
+    if context.user_data.get("awaiting_examday_day"):
+        context.user_data.pop("awaiting_examday_day")
+        await handle_examday_day_input(update.message, context, text)
+        return
+
+    if context.user_data.get("awaiting_examday_month"):
+        context.user_data.pop("awaiting_examday_month")
+        await handle_examday_month_input(update.message, context, text)
+        return
+
+    if context.user_data.get("awaiting_examday_time"):
+        context.user_data.pop("awaiting_examday_time")
+        await handle_examday_time_input(update.message, context, text)
+        return
+
+    if context.user_data.get("awaiting_note_title"):
+        context.user_data.pop("awaiting_note_title")
+        if not is_admin(chat_id):
+            await update.message.reply_text("⛔ الميزة دي للأدمن بس.")
+            return
+        transcript = context.user_data.pop("pending_text_note", None)
+        if not transcript:
+            await update.message.reply_text("⚠️ حصل خطأ، جرب تبعت التسجيل الصوتي تاني.")
+            return
+        context.user_data["pending_upload"] = {
+            "title": text,
+            "file_name": "ملاحظة صوتية",
+            "telegram_file_id": None,
+            "channel_message_id": None,
+            "owner_chat_id": chat_id,
+            "is_text_note": True,
+            "text_content": transcript,
+        }
+        await update.message.reply_text(
+            "📅 اختار السنة الدراسية لهذه الملاحظة:",
+            reply_markup=years_keyboard("saveyear"),
+        )
+        return
+
     # بحث مباشر
     result = (
         supabase.table("books").select("*")
@@ -507,7 +603,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for row in rows:
-        await context.bot.send_document(chat_id=chat_id, document=row["telegram_file_id"], caption=build_caption(row))
+        await send_book_row(context.bot, chat_id, row)
 
 
 # ============ التصفح: /menu ============
@@ -559,7 +655,7 @@ async def send_files_for(query, context, year, term, subject, section):
         return
     await query.edit_message_text(f"📚 ملفات {subject}:")
     for row in rows:
-        await context.bot.send_document(chat_id=query.message.chat_id, document=row["telegram_file_id"], caption=build_caption(row))
+        await send_book_row(context.bot, query.message.chat_id, row)
 
 
 async def handle_browse_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -630,7 +726,7 @@ async def find_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ مفيش نتايج بالاسم ده.")
         return
     for row in rows:
-        await context.bot.send_document(chat_id=update.message.chat_id, document=row["telegram_file_id"], caption=build_caption(row))
+        await send_book_row(context.bot, update.message.chat_id, row)
 
 
 # ============ /recent ============
@@ -647,7 +743,7 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🕐 آخر 5 ملفات:")
     for row in rows:
-        await context.bot.send_document(chat_id=update.message.chat_id, document=row["telegram_file_id"], caption=build_caption(row))
+        await send_book_row(context.bot, update.message.chat_id, row)
 
 
 # ============ حذف آمن: /delete (استرجاع خلال 24 ساعة) ============
@@ -816,6 +912,33 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
+    result = supabase.table("books").select("subject, reviewed").is_("deleted_at", "null").execute()
+    rows = result.data
+    if not rows:
+        await update.message.reply_text("لسه مفيش أي ملفات محفوظة.")
+        return
+
+    per_subject = {}
+    for r in rows:
+        subject = r.get("subject") or "بدون مادة"
+        per_subject.setdefault(subject, {"total": 0, "reviewed": 0})
+        per_subject[subject]["total"] += 1
+        if r.get("reviewed"):
+            per_subject[subject]["reviewed"] += 1
+
+    lines = ["📈 نسبة المذاكرة لكل مادة:\n"]
+    for subject, counts in sorted(per_subject.items()):
+        pct = round((counts["reviewed"] / counts["total"]) * 100) if counts["total"] else 0
+        filled = round(pct / 10)
+        bar = "▓" * filled + "░" * (10 - filled)
+        lines.append(f"{subject}\n{bar} {pct}% ({counts['reviewed']}/{counts['total']})")
+
+    await update.message.reply_text("\n\n".join(lines))
+
+
 # ============ الذكاء الاصطناعي: تلخيص وسؤال ============
 async def get_book_row(book_id):
     result = supabase.table("books").select("*").eq("id", book_id).execute()
@@ -824,13 +947,35 @@ async def get_book_row(book_id):
     return result.data[0]
 
 
-async def download_to_temp_file(context, telegram_file_id):
+async def download_to_temp_file(context, telegram_file_id, suffix=".pdf"):
     """ينزل الملف مؤقتًا على قرص السيرفر (مش في الذاكرة) ويرجع مسار الملف"""
     tg_file = await context.bot.get_file(telegram_file_id)
-    fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     await tg_file.download_to_drive(tmp_path)
     return tmp_path
+
+
+async def run_ocr_and_reply(context, chat_id, photo_file_id):
+    """يستخرج النص من الصورة تلقائيًا ويبعته كرسالة إضافية بعد الحفظ"""
+    tmp_path = None
+    gemini_file = None
+    try:
+        tmp_path = await download_to_temp_file(context, photo_file_id, suffix=".jpg")
+        gemini_file = await asyncio.to_thread(gemini_client.files.upload, file=tmp_path)
+        prompt = (
+            "استخرج كل النص الموجود في هذه الصورة بالكامل، ورتبه بشكل واضح ومنظم. "
+            "لو مفيش نص واضح، قول 'مفيش نص واضح في الصورة'. اكتب بنفس لغة النص الأصلي."
+        )
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
+        )
+        extracted = response.text
+        await context.bot.send_message(chat_id=chat_id, text=f"🔎 النص المستخرج من الصورة:\n\n{extracted}")
+    except Exception:
+        pass  # لو فشل الاستخراج، ميضايقش المستخدم، الصورة الأصلية اتحفظت عادي
+    finally:
+        await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
 
 
 async def cleanup_temp_and_gemini_file(tmp_path, gemini_file):
@@ -917,29 +1062,38 @@ async def handle_quiz_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("⚠️ الملف مش موجود.")
         return
 
+    base_prompt = (
+        "اعمل اختبار (كويز) كامل من المحتوى المرفق يتكون من جزئين:\n"
+        "1) 20 سؤال اختيار من متعدد (MCQ)، كل سؤال له 4 اختيارات مرقمة (أ، ب، ج، د)، "
+        "بدون كتابة الإجابة الصحيحة جنب السؤال.\n"
+        "2) 5 أسئلة مقالية تحتاج شرح وتفكير، بدون إجابات.\n"
+        "بعد كل الأسئلة، اكتب قسم منفصل بعنوان 'الإجابات الصحيحة' فيه إجابات الـ 20 سؤال الاختياري فقط "
+        "(رقم السؤال والحرف الصحيح).\n"
+        "اكتب الكويز كامل بنفس لغة المحتوى الأصلي بالضبط."
+    )
+
     tmp_path = None
     gemini_file = None
     try:
-        # 1) تنزيل مؤقت من تليجرام على قرص السيرفر
-        tmp_path = await download_to_temp_file(context, row["telegram_file_id"])
-
-        # 2) رفع فوري لسيرفرات جوجل
-        gemini_file = await asyncio.to_thread(gemini_client.files.upload, file=tmp_path)
-
-        # 3) طلب الكويز
-        prompt = (
-            "اعمل اختبار (كويز) كامل من محتوى هذا الملف يتكون من جزئين:\n"
-            "1) 20 سؤال اختيار من متعدد (MCQ)، كل سؤال له 4 اختيارات مرقمة (أ، ب، ج، د)، "
-            "بدون كتابة الإجابة الصحيحة جنب السؤال.\n"
-            "2) 5 أسئلة مقالية تحتاج شرح وتفكير، بدون إجابات.\n"
-            "بعد كل الأسئلة، اكتب قسم منفصل بعنوان 'الإجابات الصحيحة' فيه إجابات الـ 20 سؤال الاختياري فقط "
-            "(رقم السؤال والحرف الصحيح).\n"
-            "اكتب الكويز كامل بنفس لغة الملف الأصلي بالضبط (لو الملف بالإنجليزي اكتب بالإنجليزي، لو عربي فبالعربي)."
-        )
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
-        )
+        if row.get("is_text_note"):
+            content = row.get("text_content", "")
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model=GEMINI_MODEL_NAME,
+                contents=[f"المحتوى:\n{content}\n\n{base_prompt}"],
+            )
+        else:
+            tmp_path = await download_to_temp_file(context, row["telegram_file_id"])
+            gemini_file = await asyncio.to_thread(gemini_client.files.upload, file=tmp_path)
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, base_prompt]
+            )
         quiz_text = response.text
+
+        subject_for_bank = row.get("subject", "")
+        supabase.table("quiz_bank").insert({
+            "chat_id": query.message.chat_id, "subject": subject_for_bank, "quiz_text": quiz_text,
+        }).execute()
 
         await query.edit_message_text(f"📋 كويز: {row['title']}")
         await send_long_text(query.message, quiz_text, is_callback=False)
@@ -949,6 +1103,29 @@ async def handle_quiz_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     finally:
         await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
+
+
+async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
+    chat_id = update.message.chat_id
+    subject_filter = " ".join(context.args)
+
+    q = supabase.table("quiz_bank").select("*").eq("chat_id", chat_id)
+    if subject_filter:
+        q = q.ilike("subject", f"%{subject_filter}%")
+    result = q.execute()
+    rows = result.data
+    if not rows:
+        await update.message.reply_text("مفيش كويزات محفوظة في بنك الأسئلة لسه. اعمل /quiz على أي ملف الأول.")
+        return
+
+    import random
+    chosen = random.choice(rows)
+    await update.message.reply_text(f"🧠 مراجعة عشوائية — مادة: {chosen.get('subject') or 'غير محدد'}")
+    await send_long_text(update.message, chosen["quiz_text"])
+
+
 
 
 async def handle_summarize_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1077,32 +1254,197 @@ async def answer_question_about_book(message, context, book_id, question):
     tmp_path = None
     gemini_file = None
     try:
-        # 1) تنزيل مؤقت من تليجرام على قرص السيرفر
-        tmp_path = await download_to_temp_file(context, row["telegram_file_id"])
-
-        # 2) رفع فوري لجوجل
-        gemini_file = await asyncio.to_thread(
-            gemini_client.files.upload, file=tmp_path
-        )
-
-        # 3) طلب الإجابة
         prompt = (
-            f"أجب عن السؤال التالي بالاعتماد فقط على محتوى الملف المرفق، "
-            f"واذكر رقم الصفحة إن أمكن. جاوب بنفس لغة الملف الأصلي.\n\nالسؤال: {question}"
+            f"أجب عن السؤال التالي بالاعتماد فقط على المحتوى المرفق، "
+            f"واذكر رقم الصفحة إن أمكن. جاوب بنفس لغة المحتوى الأصلي.\n\nالسؤال: {question}"
         )
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
-        )
+        if row.get("is_text_note"):
+            content = row.get("text_content", "")
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model=GEMINI_MODEL_NAME,
+                contents=[f"المحتوى:\n{content}\n\n{prompt}"],
+            )
+        else:
+            tmp_path = await download_to_temp_file(context, row["telegram_file_id"])
+            gemini_file = await asyncio.to_thread(gemini_client.files.upload, file=tmp_path)
+            response = await asyncio.to_thread(
+                gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
+            )
         answer = response.text
 
-        await send_long_text(message, f"📘 من ملف: {row['title']}\n\n{answer}")
+        # اقتراح ملفات تانية في نفس المادة ممكن يكون فيها نفس الموضوع
+        related_note = ""
+        if row.get("subject"):
+            related = (
+                supabase.table("books").select("title")
+                .eq("subject", row["subject"]).neq("id", book_id)
+                .is_("deleted_at", "null").limit(4).execute()
+            )
+            if related.data:
+                titles = "، ".join(r["title"] for r in related.data)
+                related_note = f"\n\n📎 الموضوع ده ممكن يكون موجود كمان في: {titles}"
+
+        await send_long_text(message, f"📘 من ملف: {row['title']}\n\n{answer}{related_note}")
 
     except Exception as e:
         await message.reply_text(f"⚠️ حصل خطأ: {e}")
 
     finally:
-        # 4) تنظيف مضمون في كل الحالات
+        # تنظيف مضمون في كل الحالات
         await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
+
+
+# ============ وضع الامتحان الشامل: /examday ============
+async def examday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
+    if not gemini_client:
+        await update.message.reply_text("⚠️ الميزة دي محتاجة GEMINI_API_KEY مفعّل.")
+        return
+    subject = " ".join(context.args)
+    if not subject:
+        await update.message.reply_text("اكتب كده: /examday اسم المادة\n(هيسألك بعد كده على تاريخ الامتحان)")
+        return
+    context.user_data["_examday_subject_cache"] = subject
+    context.user_data["awaiting_examday_day"] = True
+    await update.message.reply_text("📅 امتحان المادة دي إمتى؟ اكتب رقم اليوم (من 1 لـ 31):")
+
+
+async def handle_examday_day_input(message, context, text):
+    try:
+        day = int(text.strip())
+        assert 1 <= day <= 31
+    except Exception:
+        await message.reply_text("⚠️ اكتب رقم صحيح من 1 لـ 31.")
+        return
+    context.user_data["_examday_day_cache"] = day
+    context.user_data["awaiting_examday_month"] = True
+    await message.reply_text("📆 اكتب رقم الشهر (من 1 لـ 12):")
+
+
+async def handle_examday_month_input(message, context, text):
+    try:
+        month = int(text.strip())
+        assert 1 <= month <= 12
+    except Exception:
+        await message.reply_text("⚠️ اكتب رقم صحيح من 1 لـ 12.")
+        return
+    context.user_data["_examday_month_cache"] = month
+    context.user_data["awaiting_examday_time"] = True
+    await message.reply_text("🕐 اكتب معاد الامتحان بصيغة 12 ساعة، زي: 9:00 AM")
+
+
+async def handle_examday_time_input(message, context, text):
+    parsed = parse_12h_time(text)
+    if not parsed:
+        await message.reply_text("⚠️ الصيغة غلط، اكتب زي كده: 9:00 AM")
+        return
+    hour, minute = parsed
+
+    subject = context.user_data.pop("_examday_subject_cache", None)
+    day = context.user_data.pop("_examday_day_cache", None)
+    month = context.user_data.pop("_examday_month_cache", None)
+    if not subject or not day or not month:
+        await message.reply_text("⚠️ حصل خطأ، ابدأ من /examday تاني.")
+        return
+
+    exam_at = compute_next_occurrence(day, month, hour, minute)
+    if not exam_at:
+        await message.reply_text("⚠️ التاريخ ده مش موجود.")
+        return
+
+    chat_id = message.chat_id
+
+    # جمع كل ملفات المادة دي (حد أقصى 6 ملفات عشان السرعة والتكلفة)
+    result = (
+        supabase.table("books").select("*")
+        .ilike("subject", f"%{subject}%").is_("deleted_at", "null")
+        .limit(6).execute()
+    )
+    rows = result.data
+    if not rows:
+        await message.reply_text(f"❌ مفيش ملفات محفوظة في مادة '{subject}'.")
+        return
+
+    await message.reply_text(f"⏳ بجهز مذاكرة شاملة من {len(rows)} ملف، ده ممكن ياخد شوية وقت...")
+
+    tmp_paths = []
+    gemini_files = []
+    contents_parts = []
+    try:
+        for row in rows:
+            if row.get("is_text_note"):
+                contents_parts.append(f"ملاحظة بعنوان {row['title']}:\n{row.get('text_content', '')}")
+            else:
+                tmp_path = await download_to_temp_file(context, row["telegram_file_id"])
+                tmp_paths.append(tmp_path)
+                gfile = await asyncio.to_thread(gemini_client.files.upload, file=tmp_path)
+                gemini_files.append(gfile)
+                contents_parts.append(gfile)
+
+        summary_prompt = (
+            f"دي كل ملفات مادة '{subject}' المطلوبة للامتحان. "
+            "اعمل ملخص شامل ومركز يجمع أهم النقاط من كل الملفات دي مع بعض في ملخص واحد منظم بالنقاط. "
+            "اكتب بنفس لغة أغلب الملفات."
+        )
+        summary_response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=GEMINI_MODEL_NAME,
+            contents=contents_parts + [summary_prompt],
+        )
+        await message.reply_text(f"📝 ملخص شامل لمادة {subject}:")
+        await send_long_text(message, summary_response.text)
+
+        quiz_prompt = (
+            f"من نفس ملفات مادة '{subject}' دي، اعمل كويز شامل: "
+            "20 سؤال اختيار من متعدد (4 اختيارات لكل سؤال) بدون إجابات جنبها، "
+            "و5 أسئلة مقالية، وفي الآخر قسم منفصل بعنوان 'الإجابات الصحيحة' للأسئلة الاختيارية فقط. "
+            "اكتب بنفس لغة أغلب الملفات."
+        )
+        quiz_response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=GEMINI_MODEL_NAME,
+            contents=contents_parts + [quiz_prompt],
+        )
+        await message.reply_text(f"📋 كويز شامل لمادة {subject}:")
+        await send_long_text(message, quiz_response.text)
+
+        supabase.table("quiz_bank").insert({
+            "chat_id": chat_id, "subject": subject, "quiz_text": quiz_response.text,
+        }).execute()
+
+    except Exception as e:
+        await message.reply_text(f"⚠️ حصل خطأ أثناء التجهيز: {e}")
+    finally:
+        for gfile in gemini_files:
+            try:
+                await asyncio.to_thread(gemini_client.files.delete, name=gfile.name)
+            except Exception:
+                pass
+        for path in tmp_paths:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        gc.collect()
+
+    # تذكير تلقائي قبل الامتحان بـ 24 ساعة
+    reminder_at = exam_at - datetime.timedelta(hours=24)
+    now = datetime.datetime.now()
+    if reminder_at > now:
+        result = supabase.table("reminders").insert({
+            "chat_id": chat_id, "subject": f"امتحان {subject} بكرة!", "remind_at": reminder_at.isoformat(),
+        }).execute()
+        reminder_id = result.data[0]["id"]
+        schedule_reminder_job(context.application, chat_id, f"امتحان {subject} بكرة!", reminder_at, reminder_id)
+        await message.reply_text(
+            f"✅ خلصت المذاكرة الشاملة، وهفكرك تلقائي قبل الامتحان بـ 24 ساعة "
+            f"({reminder_at.strftime('%d/%m/%Y الساعة %I:%M %p')})."
+        )
+    else:
+        await message.reply_text("✅ خلصت المذاكرة الشاملة. (الامتحان قريب جدًا فمقدرتش أظبط تذكير قبله بـ24 ساعة)")
 
 
 # ============ تذكير لمرة واحدة (يوم + شهر محددين) ============
@@ -1321,6 +1663,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ علامة مذاكرة: /reviewed اسم الملف\n"
         "📝 تلخيص ملف بالذكاء الاصطناعي: /summarize اسم الملف\n"
         "📋 كويز 20 اختياري + 5 مقالي: /quiz اسم الملف\n"
+        "🎯 وضع امتحان شامل لمادة كاملة: /examday اسم المادة\n"
+        "🧠 مراجعة عشوائية من بنك الأسئلة: /review (أو /review اسم مادة)\n"
+        "📈 تقدمك في كل مادة: /progress\n"
+        "🎙️ ابعت رسالة صوتية وهحولها نص منظم\n"
         "❓ سؤال عن محتوى ملف: /ask اسم الملف\n"
         "🤖 سؤال عام لأي موضوع: /ai سؤالك\n"
         "🔔 تذكيراتي: /myreminders"
@@ -1362,8 +1708,12 @@ def main():
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("myreminders", myreminders_command))
     app.add_handler(CommandHandler("unremind", unremind_command))
+    app.add_handler(CommandHandler("examday", examday_command))
+    app.add_handler(CommandHandler("review", review_command))
+    app.add_handler(CommandHandler("progress", progress_command))
 
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_handler(CallbackQueryHandler(handle_quickuse, pattern=r"^quickuse$"))
