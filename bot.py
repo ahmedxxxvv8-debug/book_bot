@@ -17,6 +17,7 @@ from telegram.ext import (
 )
 from supabase import create_client
 from google import genai
+from google.genai import types as genai_types
 
 # ============ الإعدادات ============
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -30,7 +31,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=180_000),  # 180 ثانية بدل الافتراضي
+    )
 else:
     gemini_client = None
 
@@ -1356,11 +1360,11 @@ async def handle_examday_time_input(message, context, text):
 
     chat_id = message.chat_id
 
-    # جمع كل ملفات المادة دي (حد أقصى 6 ملفات عشان السرعة والتكلفة)
+    # جمع ملفات المادة دي (حد أقصى 3 ملفات عشان السرعة وتجنب انقطاع الاتصال)
     result = (
         supabase.table("books").select("*")
         .ilike("subject", f"%{subject}%").is_("deleted_at", "null")
-        .limit(6).execute()
+        .limit(3).execute()
     )
     rows = result.data
     if not rows:
