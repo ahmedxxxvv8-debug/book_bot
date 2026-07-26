@@ -486,6 +486,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_remind_day_input(update.message, context, text)
         return
 
+    if context.user_data.get("awaiting_remind_month"):
+        context.user_data.pop("awaiting_remind_month")
+        await handle_remind_month_input(update.message, context, text)
+        return
+
     if context.user_data.get("awaiting_remind_time"):
         context.user_data.pop("awaiting_remind_time")
         await handle_remind_time_input(update.message, context, text)
@@ -1067,17 +1072,17 @@ async def answer_question_about_book(message, context, book_id, question):
         await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
 
 
-# ============ التذكيرات الشهرية ============
+# ============ تذكير لمرة واحدة (يوم + شهر محددين) ============
 async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
     subject = " ".join(context.args)
     if not subject:
-        await update.message.reply_text("اكتب كده: /remind اسم المادة\n(هيسألك بعد كده على يوم الشهر والساعة)")
+        await update.message.reply_text("اكتب كده: /remind اسم المادة\n(هيسألك بعد كده على اليوم والشهر والساعة)")
         return
     context.user_data["_remind_subject_cache"] = subject
     context.user_data["awaiting_remind_day"] = True
-    await update.message.reply_text("📅 اكتب رقم اليوم في الشهر (من 1 لـ 31):")
+    await update.message.reply_text("📅 اكتب رقم اليوم (من 1 لـ 31):")
 
 
 async def handle_remind_day_input(message, context, text):
@@ -1089,6 +1094,19 @@ async def handle_remind_day_input(message, context, text):
         return
 
     context.user_data["_remind_day_cache"] = day
+    context.user_data["awaiting_remind_month"] = True
+    await message.reply_text("📆 اكتب رقم الشهر (من 1 لـ 12):")
+
+
+async def handle_remind_month_input(message, context, text):
+    try:
+        month = int(text.strip())
+        assert 1 <= month <= 12
+    except Exception:
+        await message.reply_text("⚠️ اكتب رقم صحيح من 1 لـ 12.")
+        return
+
+    context.user_data["_remind_month_cache"] = month
     context.user_data["awaiting_remind_time"] = True
     await message.reply_text("🕐 اكتب الساعة بصيغة 12 ساعة، زي: 5:30 PM أو 5:30 صباحًا")
 
@@ -1109,6 +1127,19 @@ def parse_12h_time(text):
     return None
 
 
+def compute_next_occurrence(day, month, hour, minute):
+    """يحسب أقرب تاريخ ووقت مستقبلي بنفس اليوم والشهر (السنادي أو اللي بعده لو التاريخ فات)"""
+    now = datetime.datetime.now()
+    for year in (now.year, now.year + 1):
+        try:
+            target = datetime.datetime(year, month, day, hour, minute)
+        except ValueError:
+            continue  # يوم مش موجود في الشهر ده (زي 30 فبراير)
+        if target > now:
+            return target
+    return None
+
+
 async def handle_remind_time_input(message, context, text):
     chat_id = message.chat_id
     parsed = parse_12h_time(text)
@@ -1119,37 +1150,45 @@ async def handle_remind_time_input(message, context, text):
 
     subject_name = context.user_data.pop("_remind_subject_cache", None)
     day = context.user_data.pop("_remind_day_cache", None)
-    if not subject_name or not day:
+    month = context.user_data.pop("_remind_month_cache", None)
+    if not subject_name or not day or not month:
         await message.reply_text("⚠️ حصل خطأ، ابدأ من /remind تاني.")
         return
 
-    supabase.table("reminders").insert({
-        "chat_id": chat_id, "subject": subject_name, "day": day, "hour": hour, "minute": minute,
-    }).execute()
-    schedule_reminder_job(context.application, chat_id, subject_name, day, hour, minute)
+    remind_at = compute_next_occurrence(day, month, hour, minute)
+    if not remind_at:
+        await message.reply_text("⚠️ التاريخ ده مش موجود (تأكد من رقم اليوم بالنسبة للشهر ده).")
+        return
 
-    display_hour = hour % 12 or 12
-    ampm = "PM" if hour >= 12 else "AM"
+    result = supabase.table("reminders").insert({
+        "chat_id": chat_id, "subject": subject_name, "remind_at": remind_at.isoformat(),
+    }).execute()
+    reminder_id = result.data[0]["id"]
+    schedule_reminder_job(context.application, chat_id, subject_name, remind_at, reminder_id)
+
     await message.reply_text(
-        f"🔔 تمام، هفكرك يوم {day} من كل شهر الساعة {display_hour}:{minute:02d} {ampm} تراجع {subject_name}."
+        f"🔔 تمام، هفكرك مرة واحدة يوم {remind_at.strftime('%d/%m/%Y')} "
+        f"الساعة {remind_at.strftime('%I:%M %p')} تراجع {subject_name}."
     )
 
 
-def schedule_reminder_job(application, chat_id, subject, day, hour, minute):
-    job_name = f"remind:{chat_id}:{subject}"
-    application.job_queue.run_monthly(
+def schedule_reminder_job(application, chat_id, subject, remind_at, reminder_id):
+    job_name = f"remind:{chat_id}:{subject}:{reminder_id}"
+    application.job_queue.run_once(
         reminder_callback,
-        when=datetime.time(hour=hour, minute=minute),
-        day=day,
+        when=remind_at,
         chat_id=chat_id,
         name=job_name,
-        data={"subject": subject},
+        data={"subject": subject, "reminder_id": reminder_id},
     )
 
 
 async def reminder_callback(context: ContextTypes.DEFAULT_TYPE):
     subject = context.job.data["subject"]
-    await context.bot.send_message(chat_id=context.job.chat_id, text=f"🔔 وقت مراجعة: {subject}")
+    reminder_id = context.job.data.get("reminder_id")
+    await context.bot.send_message(chat_id=context.job.chat_id, text=f"🔔 تذكير: {subject}")
+    if reminder_id:
+        supabase.table("reminders").delete().eq("id", reminder_id).execute()
 
 
 async def myreminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1163,9 +1202,11 @@ async def myreminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     lines = []
     for r in rows:
-        h = r["hour"] % 12 or 12
-        ampm = "PM" if r["hour"] >= 12 else "AM"
-        lines.append(f"• {r['subject']} — يوم {r.get('day', '?')} من كل شهر — {h}:{r['minute']:02d} {ampm}")
+        if r.get("remind_at"):
+            dt = datetime.datetime.fromisoformat(r["remind_at"])
+            lines.append(f"• {r['subject']} — {dt.strftime('%d/%m/%Y الساعة %I:%M %p')}")
+        else:
+            lines.append(f"• {r['subject']}")
     await update.message.reply_text("🔔 تذكيراتك:\n" + "\n".join(lines) + "\n\nلإلغاء تذكير: /unremind اسم المادة")
 
 
@@ -1178,9 +1219,10 @@ async def unremind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اكتب كده: /unremind اسم المادة")
         return
     supabase.table("reminders").delete().eq("chat_id", chat_id).eq("subject", subject).execute()
-    jobs = context.application.job_queue.get_jobs_by_name(f"remind:{chat_id}:{subject}")
-    for job in jobs:
-        job.schedule_removal()
+    prefix = f"remind:{chat_id}:{subject}:"
+    for job in context.application.job_queue.jobs():
+        if job.name and job.name.startswith(prefix):
+            job.schedule_removal()
     await update.message.reply_text(f"✅ اتلغى تذكير {subject}.")
 
 
@@ -1236,7 +1278,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🗑️ حذف: /delete اسم الملف\n"
             "↩️ استرجاع: /trash\n"
             "✏️ تعديل الاسم: /rename اسم الملف\n"
-            "🔔 تذكير شهري: /remind اسم المادة\n"
+            "🔔 تذكير لمرة واحدة: /remind اسم المادة\n"
         )
     text += (
         "📂 تصفح: /menu\n"
@@ -1253,10 +1295,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def restore_reminders(app_):
+    now = datetime.datetime.now()
     result = supabase.table("reminders").select("*").execute()
     for r in result.data:
-        if r.get("day"):
-            schedule_reminder_job(app_, r["chat_id"], r["subject"], r["day"], r["hour"], r["minute"])
+        if not r.get("remind_at"):
+            continue
+        remind_at = datetime.datetime.fromisoformat(r["remind_at"])
+        if remind_at <= now:
+            # فات وقته وقت ما البوت كان واقف، امسحه من غير ما يبعت متأخر
+            supabase.table("reminders").delete().eq("id", r["id"]).execute()
+            continue
+        schedule_reminder_job(app_, r["chat_id"], r["subject"], remind_at, r["id"])
 
 
 def main():
