@@ -17,7 +17,6 @@ from telegram.ext import (
 )
 from supabase import create_client
 from google import genai
-from google.genai import types as genai_types
 
 # ============ الإعدادات ============
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -31,10 +30,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if GEMINI_API_KEY:
-    gemini_client = genai.Client(
-        api_key=GEMINI_API_KEY,
-        http_options=genai_types.HttpOptions(timeout=180_000),  # 180 ثانية بدل الافتراضي
-    )
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     gemini_client = None
 
