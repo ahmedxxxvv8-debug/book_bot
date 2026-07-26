@@ -481,6 +481,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await answer_question_about_book(update.message, context, book_id, text)
         return
 
+    if context.user_data.get("awaiting_remind_day"):
+        context.user_data.pop("awaiting_remind_day")
+        await handle_remind_day_input(update.message, context, text)
+        return
+
     if context.user_data.get("awaiting_remind_time"):
         context.user_data.pop("awaiting_remind_time")
         await handle_remind_time_input(update.message, context, text)
@@ -872,6 +877,75 @@ async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("اختار الملف اللي عايز تلخيصه:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
+async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_message(update):
+        return
+    if not gemini_client:
+        await update.message.reply_text("⚠️ ميزة الكويز مش مفعّلة، لازم يتضاف GEMINI_API_KEY.")
+        return
+    query_text = " ".join(context.args)
+    if not query_text:
+        await update.message.reply_text("اكتب كده: /quiz اسم الكتاب")
+        return
+    result = (
+        supabase.table("books").select("id, title")
+        .ilike("title", f"%{query_text}%").is_("deleted_at", "null").execute()
+    )
+    rows = result.data
+    if not rows:
+        await update.message.reply_text("❌ مفيش نتايج بالاسم ده.")
+        return
+    buttons = [[InlineKeyboardButton(r["title"][:40], callback_data=f"quiz:{r['id']}")] for r in rows]
+    await update.message.reply_text("اختار الملف اللي عايز تعمله كويز:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def handle_quiz_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_auth_callback(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    book_id = query.data.split(":")[1]
+    await query.edit_message_text("⏳ بجهز الكويز، ده ممكن ياخد دقيقة أو اتنين...")
+
+    row = await get_book_row(book_id)
+    if not row:
+        await query.edit_message_text("⚠️ الملف مش موجود.")
+        return
+
+    tmp_path = None
+    gemini_file = None
+    try:
+        # 1) تنزيل مؤقت من تليجرام على قرص السيرفر
+        tmp_path = await download_to_temp_file(context, row["telegram_file_id"])
+
+        # 2) رفع فوري لسيرفرات جوجل
+        gemini_file = await asyncio.to_thread(gemini_client.files.upload, file=tmp_path)
+
+        # 3) طلب الكويز
+        prompt = (
+            "اعمل اختبار (كويز) كامل من محتوى هذا الملف يتكون من جزئين:\n"
+            "1) 20 سؤال اختيار من متعدد (MCQ)، كل سؤال له 4 اختيارات مرقمة (أ، ب، ج، د)، "
+            "بدون كتابة الإجابة الصحيحة جنب السؤال.\n"
+            "2) 5 أسئلة مقالية تحتاج شرح وتفكير، بدون إجابات.\n"
+            "بعد كل الأسئلة، اكتب قسم منفصل بعنوان 'الإجابات الصحيحة' فيه إجابات الـ 20 سؤال الاختياري فقط "
+            "(رقم السؤال والحرف الصحيح).\n"
+            "اكتب الكويز كامل بنفس لغة الملف الأصلي بالضبط (لو الملف بالإنجليزي اكتب بالإنجليزي، لو عربي فبالعربي)."
+        )
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content, model=GEMINI_MODEL_NAME, contents=[gemini_file, prompt]
+        )
+        quiz_text = response.text
+
+        await query.edit_message_text(f"📋 كويز: {row['title']}")
+        await send_long_text(query.message, quiz_text, is_callback=False)
+
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ حصل خطأ أثناء عمل الكويز: {e}")
+
+    finally:
+        await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
+
+
 async def handle_summarize_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_callback(update):
         return
@@ -993,44 +1067,80 @@ async def answer_question_about_book(message, context, book_id, question):
         await cleanup_temp_and_gemini_file(tmp_path, gemini_file)
 
 
-# ============ التذكيرات اليومية ============
+# ============ التذكيرات الشهرية ============
 async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
     subject = " ".join(context.args)
     if not subject:
-        await update.message.reply_text("اكتب كده: /remind اسم المادة\n(هيسألك بعد كده على أنهي وقت)")
+        await update.message.reply_text("اكتب كده: /remind اسم المادة\n(هيسألك بعد كده على يوم الشهر والساعة)")
         return
     context.user_data["_remind_subject_cache"] = subject
+    context.user_data["awaiting_remind_day"] = True
+    await update.message.reply_text("📅 اكتب رقم اليوم في الشهر (من 1 لـ 31):")
+
+
+async def handle_remind_day_input(message, context, text):
+    try:
+        day = int(text.strip())
+        assert 1 <= day <= 31
+    except Exception:
+        await message.reply_text("⚠️ اكتب رقم صحيح من 1 لـ 31.")
+        return
+
+    context.user_data["_remind_day_cache"] = day
     context.user_data["awaiting_remind_time"] = True
-    await update.message.reply_text("🕐 اكتب الوقت اليومي للتذكير (بالصيغة HH:MM) زي: 17:30")
+    await message.reply_text("🕐 اكتب الساعة بصيغة 12 ساعة، زي: 5:30 PM أو 5:30 صباحًا")
+
+
+def parse_12h_time(text):
+    """يقبل صيغ زي: 5:30 PM / 05:30 pm / 5:30 م / 5:30 ص"""
+    cleaned = text.strip().upper()
+    cleaned = cleaned.replace("صباحا", "AM").replace("صباحاً", "AM").replace("ص", "AM")
+    cleaned = cleaned.replace("مساء", "PM").replace("مساءً", "PM").replace("م", "PM")
+    cleaned = cleaned.replace("  ", " ").strip()
+
+    for fmt in ("%I:%M %p", "%I:%M%p", "%I %p"):
+        try:
+            dt = datetime.datetime.strptime(cleaned, fmt)
+            return dt.hour, dt.minute
+        except ValueError:
+            continue
+    return None
 
 
 async def handle_remind_time_input(message, context, text):
     chat_id = message.chat_id
-    try:
-        hour, minute = map(int, text.strip().split(":"))
-        assert 0 <= hour <= 23 and 0 <= minute <= 59
-    except Exception:
-        await message.reply_text("⚠️ الصيغة غلط، اكتب زي كده: 17:30")
+    parsed = parse_12h_time(text)
+    if not parsed:
+        await message.reply_text("⚠️ الصيغة غلط، اكتب زي كده: 5:30 PM أو 5:30 صباحًا")
         return
+    hour, minute = parsed
 
     subject_name = context.user_data.pop("_remind_subject_cache", None)
-    if not subject_name:
+    day = context.user_data.pop("_remind_day_cache", None)
+    if not subject_name or not day:
         await message.reply_text("⚠️ حصل خطأ، ابدأ من /remind تاني.")
         return
 
-    supabase.table("reminders").insert({"chat_id": chat_id, "subject": subject_name, "hour": hour, "minute": minute}).execute()
-    schedule_reminder_job(context.application, chat_id, subject_name, hour, minute)
+    supabase.table("reminders").insert({
+        "chat_id": chat_id, "subject": subject_name, "day": day, "hour": hour, "minute": minute,
+    }).execute()
+    schedule_reminder_job(context.application, chat_id, subject_name, day, hour, minute)
 
-    await message.reply_text(f"🔔 تمام، هفكرك كل يوم الساعة {hour:02d}:{minute:02d} تراجع {subject_name}.")
+    display_hour = hour % 12 or 12
+    ampm = "PM" if hour >= 12 else "AM"
+    await message.reply_text(
+        f"🔔 تمام، هفكرك يوم {day} من كل شهر الساعة {display_hour}:{minute:02d} {ampm} تراجع {subject_name}."
+    )
 
 
-def schedule_reminder_job(application, chat_id, subject, hour, minute):
+def schedule_reminder_job(application, chat_id, subject, day, hour, minute):
     job_name = f"remind:{chat_id}:{subject}"
-    application.job_queue.run_daily(
+    application.job_queue.run_monthly(
         reminder_callback,
-        time=datetime.time(hour=hour, minute=minute),
+        when=datetime.time(hour=hour, minute=minute),
+        day=day,
         chat_id=chat_id,
         name=job_name,
         data={"subject": subject},
@@ -1051,7 +1161,11 @@ async def myreminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not rows:
         await update.message.reply_text("مفيش تذكيرات محفوظة.")
         return
-    lines = [f"• {r['subject']} — {r['hour']:02d}:{r['minute']:02d}" for r in rows]
+    lines = []
+    for r in rows:
+        h = r["hour"] % 12 or 12
+        ampm = "PM" if r["hour"] >= 12 else "AM"
+        lines.append(f"• {r['subject']} — يوم {r.get('day', '?')} من كل شهر — {h}:{r['minute']:02d} {ampm}")
     await update.message.reply_text("🔔 تذكيراتك:\n" + "\n".join(lines) + "\n\nلإلغاء تذكير: /unremind اسم المادة")
 
 
@@ -1122,7 +1236,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🗑️ حذف: /delete اسم الملف\n"
             "↩️ استرجاع: /trash\n"
             "✏️ تعديل الاسم: /rename اسم الملف\n"
-            "🔔 تذكير يومي: /remind اسم المادة\n"
+            "🔔 تذكير شهري: /remind اسم المادة\n"
         )
     text += (
         "📂 تصفح: /menu\n"
@@ -1131,6 +1245,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🕐 آخر الملفات: /recent\n"
         "✅ علامة مذاكرة: /reviewed اسم الملف\n"
         "📝 تلخيص ملف بالذكاء الاصطناعي: /summarize اسم الملف\n"
+        "📋 كويز 20 اختياري + 5 مقالي: /quiz اسم الملف\n"
         "❓ سؤال عن محتوى ملف: /ask اسم الملف\n"
         "🔔 تذكيراتي: /myreminders"
     )
@@ -1140,7 +1255,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def restore_reminders(app_):
     result = supabase.table("reminders").select("*").execute()
     for r in result.data:
-        schedule_reminder_job(app_, r["chat_id"], r["subject"], r["hour"], r["minute"])
+        if r.get("day"):
+            schedule_reminder_job(app_, r["chat_id"], r["subject"], r["day"], r["hour"], r["minute"])
 
 
 def main():
@@ -1157,6 +1273,7 @@ def main():
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("reviewed", reviewed_command))
     app.add_handler(CommandHandler("summarize", summarize_command))
+    app.add_handler(CommandHandler("quiz", quiz_command))
     app.add_handler(CommandHandler("ask", ask_command))
     app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(CommandHandler("myreminders", myreminders_command))
@@ -1189,6 +1306,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_rename_select, pattern=r"^rename:"))
     app.add_handler(CallbackQueryHandler(handle_toggle_reviewed, pattern=r"^toggleReviewed:"))
     app.add_handler(CallbackQueryHandler(handle_summarize_select, pattern=r"^summarize:"))
+    app.add_handler(CallbackQueryHandler(handle_quiz_select, pattern=r"^quiz:"))
     app.add_handler(CallbackQueryHandler(handle_ask_select, pattern=r"^askfile:"))
 
     # النسخة الاحتياطية الأسبوعية - كل يوم جمعة الساعة 20:00
