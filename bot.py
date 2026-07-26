@@ -908,7 +908,7 @@ async def handle_summarize_select(update: Update, context: ContextTypes.DEFAULT_
         summary = response.text
 
         await query.edit_message_text(f"📝 ملخص: {row['title']}")
-        await send_long_text(query, summary, is_callback=False)
+        await send_long_text(query.message, summary, is_callback=False)
 
     except Exception as e:
         await query.edit_message_text(f"⚠️ حصل خطأ أثناء التلخيص: {e}")
