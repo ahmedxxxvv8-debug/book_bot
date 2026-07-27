@@ -1681,6 +1681,8 @@ async def restore_reminders(app_):
         if not r.get("remind_at"):
             continue
         remind_at = datetime.datetime.fromisoformat(r["remind_at"])
+        if remind_at.tzinfo is not None:
+            remind_at = remind_at.replace(tzinfo=None)  # عشان المقارنة تبقى متوافقة مع الوقت المحلي للسيرفر
         if remind_at <= now:
             # فات وقته وقت ما البوت كان واقف، امسحه من غير ما يبعت متأخر
             supabase.table("reminders").delete().eq("id", r["id"]).execute()
