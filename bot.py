@@ -6,7 +6,7 @@ import asyncio
 import logging
 import tempfile
 import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -1667,10 +1667,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 سؤال عام لأي موضوع: /ai سؤالك\n"
         "🔔 تذكيراتي: /myreminders"
     )
-    await update.message.reply_text(text)
+    sent_message = await update.message.reply_text(text)
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=chat_id, message_id=sent_message.message_id, disable_notification=True
+        )
+    except Exception:
+        pass  # لو التثبيت فشل لأي سبب، ميضايقش المستخدم، الرسالة اتبعتت عادي
 
 
 async def restore_reminders(app_):
+    # قايمة الأوامر اللي هتظهر في زرار "/" جنب صندوق الكتابة في تليجرام
+    commands = [
+        BotCommand("start", "الأوامر والمساعدة"),
+        BotCommand("menu", "تصفح الملفات بالسنة/الترم/المادة"),
+        BotCommand("find", "بحث باسم الكتاب أو المادة"),
+        BotCommand("recent", "آخر 5 ملفات"),
+        BotCommand("stats", "إحصائيات الأرشيف"),
+        BotCommand("progress", "تقدمك في كل مادة"),
+        BotCommand("reviewed", "علامة اتذاكر على ملف"),
+        BotCommand("summarize", "تلخيص ملف بالذكاء الاصطناعي"),
+        BotCommand("quiz", "كويز 20 اختياري + 5 مقالي"),
+        BotCommand("examday", "وضع امتحان شامل لمادة"),
+        BotCommand("review", "مراجعة عشوائية من بنك الأسئلة"),
+        BotCommand("ask", "سؤال عن محتوى ملف"),
+        BotCommand("ai", "سؤال عام لأي موضوع"),
+        BotCommand("remind", "تذكير لمرة واحدة"),
+        BotCommand("myreminders", "عرض تذكيراتي"),
+        BotCommand("delete", "حذف ملف (أدمن)"),
+        BotCommand("trash", "استرجاع ملف محذوف (أدمن)"),
+        BotCommand("rename", "تعديل اسم ملف (أدمن)"),
+        BotCommand("users", "عرض المستخدمين (أدمن)"),
+        BotCommand("revoke", "إلغاء صلاحية مستخدم (أدمن)"),
+    ]
+    try:
+        await app_.bot.set_my_commands(commands)
+    except Exception:
+        pass
+
     now = datetime.datetime.now()
     result = supabase.table("reminders").select("*").execute()
     for r in result.data:
