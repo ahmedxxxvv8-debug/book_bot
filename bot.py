@@ -188,27 +188,45 @@ def type_label(file_type):
     return FILE_TYPES.get(file_type, "")
 
 
-def build_caption(row):
+def is_reviewed_by_user(chat_id, book_id):
+    result = (
+        supabase.table("reviewed_status").select("book_id")
+        .eq("chat_id", chat_id).eq("book_id", book_id).execute()
+    )
+    return len(result.data) > 0
+
+
+def toggle_reviewed_for_user(chat_id, book_id):
+    """يبدل حالة المذاكرة لنفس المستخدم بس، ويرجع الحالة الجديدة"""
+    if is_reviewed_by_user(chat_id, book_id):
+        supabase.table("reviewed_status").delete().eq("chat_id", chat_id).eq("book_id", book_id).execute()
+        return False
+    else:
+        supabase.table("reviewed_status").insert({"chat_id": chat_id, "book_id": book_id}).execute()
+        return True
+
+
+def build_caption(row, chat_id=None):
     caption = f"📘 {row['title']}"
     if row.get("section"):
         caption += f" | سكشن {row['section']}"
     if row.get("file_type"):
         caption += f" | {type_label(row['file_type'])}"
-    if row.get("reviewed"):
-        caption += " | ✅ اتذاكر"
+    if chat_id is not None and is_reviewed_by_user(chat_id, row["id"]):
+        caption += " | ✅ اتذاكر (عندك)"
     return caption
 
 
 async def send_book_row(bot, chat_id, row):
     """يبعت الملف كمستند، أو النص كامل لو كانت ملاحظة صوتية محولة لنص"""
     if row.get("is_text_note"):
-        caption = build_caption(row)
+        caption = build_caption(row, chat_id)
         content = row.get("text_content") or "(مفيش محتوى)"
         full_text = f"{caption}\n\n{content}"
         for chunk in (full_text[i:i + 3800] for i in range(0, len(full_text), 3800)):
             await bot.send_message(chat_id=chat_id, text=chunk)
     else:
-        await bot.send_document(chat_id=chat_id, document=row["telegram_file_id"], caption=build_caption(row))
+        await bot.send_document(chat_id=chat_id, document=row["telegram_file_id"], caption=build_caption(row, chat_id))
 
 
 # ============ استقبال ملف (رفع) ============
@@ -372,7 +390,7 @@ async def finalize_save(target, context, year, term, subject, section, file_type
 
     supabase.table("books").insert({
         **pending, "year": year, "term": term, "subject": subject,
-        "section": section, "file_type": file_type, "reviewed": False,
+        "section": section, "file_type": file_type,
     }).execute()
 
     context.user_data["last_selection"] = {
@@ -762,16 +780,17 @@ async def handle_rename_select(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text("✏️ اكتب الاسم الجديد في رسالة:")
 
 
-# ============ ✅ علامة اتذاكر: /reviewed ============
+# ============ ✅ علامة اتذاكر (خاصة بكل مستخدم): /reviewed ============
 async def reviewed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
+    chat_id = update.message.chat_id
     query_text = " ".join(context.args)
     if not query_text:
         await update.message.reply_text("اكتب كده: /reviewed اسم الكتاب")
         return
     result = (
-        supabase.table("books").select("id, title, reviewed")
+        supabase.table("books").select("id, title")
         .ilike("title", f"%{query_text}%").is_("deleted_at", "null").execute()
     )
     rows = result.data
@@ -780,9 +799,12 @@ async def reviewed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     buttons = []
     for r in rows:
-        mark = "✅" if r.get("reviewed") else "⬜"
+        mark = "✅" if is_reviewed_by_user(chat_id, r["id"]) else "⬜"
         buttons.append([InlineKeyboardButton(f"{mark} {r['title'][:35]}", callback_data=f"toggleReviewed:{r['id']}")])
-    await update.message.reply_text("دوس على الملف عشان تبدل حالة المذاكرة:", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text(
+        "دوس على الملف عشان تبدل حالة المذاكرة (خاصة بيك بس):",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def handle_toggle_reviewed(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -790,31 +812,87 @@ async def handle_toggle_reviewed(update: Update, context: ContextTypes.DEFAULT_T
         return
     query = update.callback_query
     await query.answer()
+    chat_id = query.message.chat_id
     book_id = query.data.split(":")[1]
-    result = supabase.table("books").select("reviewed").eq("id", book_id).execute()
-    current = result.data[0].get("reviewed", False) if result.data else False
-    supabase.table("books").update({"reviewed": not current}).eq("id", book_id).execute()
-    await query.edit_message_text("✅ اتحدثت حالة المذاكرة." if not current else "⬜ اتشالت علامة المذاكرة.")
+    now_reviewed = toggle_reviewed_for_user(chat_id, book_id)
+    await query.edit_message_text("✅ اتحدثت حالة المذاكرة عندك." if now_reviewed else "⬜ اتشالت علامة المذاكرة عندك.")
+
+
+# ============ إدارة المستخدمين: /users و /revoke ============
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_message(update):
+        return
+    result = supabase.table("authorized_users").select("*").execute()
+    rows = result.data
+    if not rows:
+        await update.message.reply_text("مفيش حد مسجل دخول لسه.")
+        return
+
+    lines = ["👥 المستخدمين المسجلين:\n"]
+    for r in rows:
+        role_label = "أدمن" if r.get("role") == "admin" else "مشاهد"
+        name = ""
+        try:
+            chat = await context.bot.get_chat(r["chat_id"])
+            if chat.first_name:
+                name = f" ({chat.first_name})"
+        except Exception:
+            pass
+        lines.append(f"• {r['chat_id']}{name} — {role_label}")
+
+    lines.append("\nلإلغاء صلاحية حد: /revoke رقمه")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin_message(update):
+        return
+    if not context.args:
+        await update.message.reply_text("اكتب كده: /revoke رقم_الشخص\n(هتلاقي الأرقام في /users)")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ اكتب رقم صحيح.")
+        return
+
+    target_role = get_role(target_id)
+    if target_role is None:
+        await update.message.reply_text("⚠️ الشخص ده مش مسجل دخول أصلاً.")
+        return
+
+    if target_role == "admin" and len(get_all_admin_chat_ids()) <= 1:
+        await update.message.reply_text("⚠️ متقدرش تشيل آخر أدمن، لازم يفضل أدمن واحد على الأقل.")
+        return
+
+    supabase.table("authorized_users").delete().eq("chat_id", target_id).execute()
+    await update.message.reply_text(
+        f"✅ اتلغت صلاحية {target_id}. لو عايز يرجع، محتاج يسجل دخول تاني بالباسورد."
+    )
 
 
 # ============ /stats ============
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
-    result = supabase.table("books").select("year, term, subject, reviewed").is_("deleted_at", "null").execute()
+    chat_id = update.message.chat_id
+    result = supabase.table("books").select("year, term, subject").is_("deleted_at", "null").execute()
     rows = result.data
     total = len(rows)
     if total == 0:
         await update.message.reply_text("لسه مفيش أي ملفات محفوظة.")
         return
-    reviewed_count = sum(1 for r in rows if r.get("reviewed"))
+
+    reviewed_result = supabase.table("reviewed_status").select("book_id").eq("chat_id", chat_id).execute()
+    reviewed_count = len(reviewed_result.data)
+
     counts = {}
     for r in rows:
         y, t = r.get("year"), r.get("term")
         if y and t:
             key = f"{YEARS.get(y, y)} - {TERMS.get(t, t)}"
             counts[key] = counts.get(key, 0) + 1
-    lines = [f"📊 إجمالي الملفات: {total}", f"✅ اتذاكر: {reviewed_count}\n"]
+    lines = [f"📊 إجمالي الملفات: {total}", f"✅ اتذاكر عندك: {reviewed_count}\n"]
     for key, count in sorted(counts.items()):
         lines.append(f"• {key}: {count} ملف")
     await update.message.reply_text("\n".join(lines))
@@ -823,21 +901,25 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_auth_message(update):
         return
-    result = supabase.table("books").select("subject, reviewed").is_("deleted_at", "null").execute()
+    chat_id = update.message.chat_id
+    result = supabase.table("books").select("id, subject").is_("deleted_at", "null").execute()
     rows = result.data
     if not rows:
         await update.message.reply_text("لسه مفيش أي ملفات محفوظة.")
         return
+
+    reviewed_result = supabase.table("reviewed_status").select("book_id").eq("chat_id", chat_id).execute()
+    reviewed_ids = set(r["book_id"] for r in reviewed_result.data)
 
     per_subject = {}
     for r in rows:
         subject = r.get("subject") or "بدون مادة"
         per_subject.setdefault(subject, {"total": 0, "reviewed": 0})
         per_subject[subject]["total"] += 1
-        if r.get("reviewed"):
+        if r["id"] in reviewed_ids:
             per_subject[subject]["reviewed"] += 1
 
-    lines = ["📈 نسبة المذاكرة لكل مادة:\n"]
+    lines = ["📈 نسبة مذاكرتك في كل مادة:\n"]
     for subject, counts in sorted(per_subject.items()):
         pct = round((counts["reviewed"] / counts["total"]) * 100) if counts["total"] else 0
         filled = round(pct / 10)
@@ -1516,22 +1598,26 @@ async def weekly_backup_job(context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         return
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["السنة", "الترم", "المادة", "السكشن", "النوع", "الاسم", "متذاكر"])
-    for r in rows:
-        writer.writerow([
-            YEARS.get(r.get("year"), ""), TERMS.get(r.get("term"), ""),
-            r.get("subject", ""), r.get("section", ""),
-            type_label(r.get("file_type")), r.get("title", ""),
-            "نعم" if r.get("reviewed") else "لا",
-        ])
-    csv_bytes = io.BytesIO(output.getvalue().encode("utf-8-sig"))
-    csv_bytes.name = "نسخة_احتياطية.csv"
-
     for admin_chat_id in get_all_admin_chat_ids():
         try:
-            csv_bytes.seek(0)
+            reviewed_result = (
+                supabase.table("reviewed_status").select("book_id").eq("chat_id", admin_chat_id).execute()
+            )
+            reviewed_ids = set(r["book_id"] for r in reviewed_result.data)
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["السنة", "الترم", "المادة", "السكشن", "النوع", "الاسم", "اتذاكر عندك؟"])
+            for r in rows:
+                writer.writerow([
+                    YEARS.get(r.get("year"), ""), TERMS.get(r.get("term"), ""),
+                    r.get("subject", ""), r.get("section", ""),
+                    type_label(r.get("file_type")), r.get("title", ""),
+                    "نعم" if r["id"] in reviewed_ids else "لا",
+                ])
+            csv_bytes = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+            csv_bytes.name = "نسخة_احتياطية.csv"
+
             await context.bot.send_document(
                 chat_id=admin_chat_id, document=csv_bytes,
                 filename="نسخة_احتياطية.csv",
@@ -1561,6 +1647,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🗑️ حذف: /delete اسم الملف\n"
             "↩️ استرجاع: /trash\n"
             "✏️ تعديل الاسم: /rename اسم الملف\n"
+            "👥 عرض المستخدمين: /users\n"
+            "🚫 إلغاء صلاحية حد: /revoke رقمه\n"
             "🔔 تذكير لمرة واحدة: /remind اسم المادة\n"
         )
     text += (
@@ -1609,6 +1697,8 @@ def main():
     app.add_handler(CommandHandler("trash", trash_command))
     app.add_handler(CommandHandler("rename", rename_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("users", users_command))
+    app.add_handler(CommandHandler("revoke", revoke_command))
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("reviewed", reviewed_command))
     app.add_handler(CommandHandler("summarize", summarize_command))
