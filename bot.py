@@ -27,6 +27,12 @@ ACCESS_PASSWORD = os.environ["ACCESS_PASSWORD"]
 VIEWER_PASSWORD = os.environ.get("VIEWER_PASSWORD")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# ============ إعدادات الويب هوك (Render) ============
+PORT = int(os.environ.get("PORT", "10000"))
+# Render بتحط الرابط ده لوحدها تلقائي في متغير RENDER_EXTERNAL_URL
+# لو بتشغل على منصة تانية، حط رابط السيرفر بتاعك في متغير WEBHOOK_URL يدويًا
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if GEMINI_API_KEY:
@@ -1778,7 +1784,19 @@ def main():
     # تنظيف سلة المحذوفات كل ساعة
     app.job_queue.run_repeating(purge_deleted_job, interval=3600, first=60)
 
-    app.run_polling()
+    if WEBHOOK_URL:
+        # وضع الويب هوك: تليجرام هو اللي بيبعت للبوت (مناسب لـ Render وأي استضافة
+        # بتشغل "Web Service" بيسمع على بورت، مش Background Worker).
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}",
+        )
+    else:
+        # وضع الـ polling القديم: شغال لو مفيش WEBHOOK_URL متحطوط
+        # (مفيد للتجربة على جهازك بنفسك).
+        app.run_polling()
 
 
 if __name__ == "__main__":
