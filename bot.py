@@ -27,12 +27,6 @@ ACCESS_PASSWORD = os.environ["ACCESS_PASSWORD"]
 VIEWER_PASSWORD = os.environ.get("VIEWER_PASSWORD")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# ============ إعدادات الويب هوك (Render) ============
-PORT = int(os.environ.get("PORT", "10000"))
-# Render بتحط الرابط ده لوحدها تلقائي في متغير RENDER_EXTERNAL_URL
-# لو بتشغل على منصة تانية، حط رابط السيرفر بتاعك في متغير WEBHOOK_URL يدويًا
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
-
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if GEMINI_API_KEY:
@@ -1720,8 +1714,11 @@ async def restore_reminders(app_):
         if remind_at.tzinfo is not None:
             remind_at = remind_at.replace(tzinfo=None)  # عشان المقارنة تبقى متوافقة مع الوقت المحلي للسيرفر
         if remind_at <= now:
-            # فات وقته وقت ما البوت كان واقف، امسحه من غير ما يبعت متأخر
-            supabase.table("reminders").delete().eq("id", r["id"]).execute()
+            if (now - remind_at) <= datetime.timedelta(hours=24):
+                # فات وقته والبوت كان نايم، ابعته متأخر بدل ما يضيع
+                schedule_reminder_job(app_, r["chat_id"], r["subject"], now + datetime.timedelta(seconds=5), r["id"])
+            else:
+                supabase.table("reminders").delete().eq("id", r["id"]).execute()
             continue
         schedule_reminder_job(app_, r["chat_id"], r["subject"], remind_at, r["id"])
 
@@ -1784,18 +1781,18 @@ def main():
     # تنظيف سلة المحذوفات كل ساعة
     app.job_queue.run_repeating(purge_deleted_job, interval=3600, first=60)
 
-    if WEBHOOK_URL:
-        # وضع الويب هوك: تليجرام هو اللي بيبعت للبوت (مناسب لـ Render وأي استضافة
-        # بتشغل "Web Service" بيسمع على بورت، مش Background Worker).
+    # على Render: Webhook (بيصحّى البوت أول ما توصل رسالة). محليًا: polling.
+    base_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if base_url:
+        port = int(os.environ.get("PORT", "10000"))
         app.run_webhook(
             listen="0.0.0.0",
-            port=PORT,
+            port=port,
             url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}",
+            webhook_url=f"{base_url.rstrip('/')}/{BOT_TOKEN}",
+            drop_pending_updates=False,
         )
     else:
-        # وضع الـ polling القديم: شغال لو مفيش WEBHOOK_URL متحطوط
-        # (مفيد للتجربة على جهازك بنفسك).
         app.run_polling()
 
 
